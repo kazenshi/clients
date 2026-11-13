@@ -1,0 +1,877 @@
+From bed6aa8c94369a87fc7421c4703b012f59c1c8df Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Echo=20Mei=C3=9Fner?= <mail@ech0.de>
+Date: Thu, 12 Mar 2026 12:34:06 +0100
+Subject: [PATCH] add proof-of-concept prf support for passkeys
+
+---
+ .../fido2/background/fido2.background.ts      |  10 +-
+ .../fido2/content/messaging/messenger.ts      |  11 +-
+ .../autofill/fido2/utils/webauthn-utils.ts    | 135 +++++++++++-
+ .../services/desktop-autofill.service.ts      |   6 +-
+ ...fido2-authenticator.service.abstraction.ts |  43 +++-
+ .../fido2/fido2-client.service.abstraction.ts |  39 ++++
+ .../fido2/fido2-authenticator.service.ts      | 206 ++++++++++++++++++
+ .../services/fido2/fido2-client.service.ts    | 121 +++++++++-
+ .../models/view/fido2-credential.view.ts      |  15 ++
+ 9 files changed, 576 insertions(+), 10 deletions(-)
+
+diff --git a/apps/browser/src/autofill/fido2/background/fido2.background.ts b/apps/browser/src/autofill/fido2/background/fido2.background.ts
+index d50aa59235..3bb238dc79 100644
+--- a/apps/browser/src/autofill/fido2/background/fido2.background.ts
++++ b/apps/browser/src/autofill/fido2/background/fido2.background.ts
+@@ -410,7 +410,15 @@ export class Fido2Background implements Fido2BackgroundInterface {
+     Promise.resolve(messageResponse)
+       .then(
+         (response) => sendResponse(response),
+-        (error) => sendResponse({ error: { ...error, message: error.message } }),
++        (error) => {
++          if (error instanceof DOMException) {
++            return sendResponse({
++              error: { ...error, type: "DOMException", name: error.name, message: error.message },
++            });
++          }
++
++          return sendResponse({ error: { ...error, message: error.message } });
++        },
+       )
+       .catch(this.logService.error);
+ 
+diff --git a/apps/browser/src/autofill/fido2/content/messaging/messenger.ts b/apps/browser/src/autofill/fido2/content/messaging/messenger.ts
+index 78bb9aa8f3..41a7f0c09c 100644
+--- a/apps/browser/src/autofill/fido2/content/messaging/messenger.ts
++++ b/apps/browser/src/autofill/fido2/content/messaging/messenger.ts
+@@ -93,9 +93,14 @@ export class Messenger {
+       abortSignal?.removeEventListener("abort", abortListener);
+ 
+       if (response.type === MessageTypes.ErrorResponse) {
+-        const error = new Error();
+-        Object.assign(error, JSON.parse(response.error));
+-        throw error;
++        const data = JSON.parse(response.error);
++        if (data.type === "DOMException") {
++          throw new DOMException(data.message, data.name);
++        } else {
++          const error = new Error();
++          Object.assign(error, data);
++          throw error;
++        }
+       }
+ 
+       return response;
+diff --git a/apps/browser/src/autofill/fido2/utils/webauthn-utils.ts b/apps/browser/src/autofill/fido2/utils/webauthn-utils.ts
+index 795e35e1e8..6db21bf9fb 100644
+--- a/apps/browser/src/autofill/fido2/utils/webauthn-utils.ts
++++ b/apps/browser/src/autofill/fido2/utils/webauthn-utils.ts
+@@ -37,6 +37,55 @@ export class WebauthnUtils {
+       })),
+       extensions: {
+         credProps: keyOptions.extensions?.credProps,
++        prf: keyOptions.extensions?.prf
++          ? {
++              eval: keyOptions.extensions.prf?.eval
++                ? {
++                    ...(keyOptions.extensions.prf.eval?.first
++                      ? {
++                          first: Fido2Utils.arrayToString(
++                            Fido2Utils.bufferSourceToUint8Array(
++                              keyOptions.extensions.prf.eval?.first,
++                            ),
++                          ),
++                        }
++                      : undefined),
++                    ...(keyOptions.extensions.prf.eval?.second
++                      ? {
++                          second: Fido2Utils.arrayToString(
++                            Fido2Utils.bufferSourceToUint8Array(
++                              keyOptions.extensions.prf.eval?.second,
++                            ),
++                          ),
++                        }
++                      : undefined),
++                  }
++                : undefined,
++              evalByCredential: keyOptions.extensions.prf?.evalByCredential
++                ? Object.fromEntries(
++                    Object.entries(keyOptions.extensions.prf.evalByCredential).map(([k, v]) => [
++                      k,
++                      {
++                        ...(v?.first
++                          ? {
++                              first: Fido2Utils.arrayToString(
++                                Fido2Utils.bufferSourceToUint8Array(v?.first),
++                              ),
++                            }
++                          : undefined),
++                        ...(v?.second
++                          ? {
++                              second: Fido2Utils.arrayToString(
++                                Fido2Utils.bufferSourceToUint8Array(v?.second),
++                              ),
++                            }
++                          : undefined),
++                      },
++                    ]),
++                  )
++                : undefined,
++            }
++          : undefined,
+       },
+       pubKeyCredParams: keyOptions.pubKeyCredParams
+         .map((params) => ({
+@@ -86,7 +135,22 @@ export class WebauthnUtils {
+         },
+       } as AuthenticatorAttestationResponse,
+       getClientExtensionResults: () => ({
+-        credProps: result.extensions.credProps,
++        credProps: result.extensions?.credProps,
++        prf: result.extensions?.prf
++          ? {
++              enabled: result.extensions.prf?.enabled,
++              results: result.extensions.prf?.results
++                ? {
++                    ...(result.extensions.prf.results?.first
++                      ? { first: Fido2Utils.stringToArray(result.extensions.prf.results?.first) }
++                      : undefined),
++                    ...(result.extensions.prf.results?.second
++                      ? { second: Fido2Utils.stringToArray(result.extensions.prf.results?.second) }
++                      : undefined),
++                  }
++                : undefined,
++            }
++          : undefined,
+       }),
+       toJSON: () => Fido2Utils.createResultToJson(result),
+     } as PublicKeyCredential;
+@@ -120,6 +184,57 @@ export class WebauthnUtils {
+       ),
+       rpId: keyOptions.rpId,
+       userVerification: keyOptions.userVerification,
++      extensions: {
++        prf: keyOptions.extensions?.prf
++          ? {
++              eval: keyOptions.extensions.prf?.eval
++                ? {
++                    ...(keyOptions.extensions.prf.eval?.first
++                      ? {
++                          first: Fido2Utils.arrayToString(
++                            Fido2Utils.bufferSourceToUint8Array(
++                              keyOptions.extensions.prf.eval?.first,
++                            ),
++                          ),
++                        }
++                      : undefined),
++                    ...(keyOptions.extensions.prf.eval?.second
++                      ? {
++                          second: Fido2Utils.arrayToString(
++                            Fido2Utils.bufferSourceToUint8Array(
++                              keyOptions.extensions.prf.eval?.second,
++                            ),
++                          ),
++                        }
++                      : undefined),
++                  }
++                : undefined,
++              evalByCredential: keyOptions.extensions.prf?.evalByCredential
++                ? Object.fromEntries(
++                    Object.entries(keyOptions.extensions.prf.evalByCredential).map(([k, v]) => [
++                      k,
++                      {
++                        ...(v?.first
++                          ? {
++                              first: Fido2Utils.arrayToString(
++                                Fido2Utils.bufferSourceToUint8Array(v?.first),
++                              ),
++                            }
++                          : undefined),
++                        ...(v?.second
++                          ? {
++                              second: Fido2Utils.arrayToString(
++                                Fido2Utils.bufferSourceToUint8Array(v?.second),
++                              ),
++                            }
++                          : undefined),
++                      },
++                    ]),
++                  )
++                : undefined,
++            }
++          : undefined,
++      },
+       timeout: keyOptions.timeout,
+       mediation: options.mediation,
+       fallbackSupported,
+@@ -137,7 +252,23 @@ export class WebauthnUtils {
+         signature: Fido2Utils.stringToArray(result.signature).buffer,
+         userHandle: Fido2Utils.stringToArray(result.userHandle).buffer,
+       } as AuthenticatorAssertionResponse,
+-      getClientExtensionResults: () => ({}),
++      getClientExtensionResults: () => ({
++        prf: result.extensions?.prf
++          ? {
++              enabled: result.extensions.prf?.enabled,
++              results: result.extensions.prf?.results
++                ? {
++                    ...(result.extensions.prf.results?.first
++                      ? { first: Fido2Utils.stringToArray(result.extensions.prf.results?.first) }
++                      : undefined),
++                    ...(result.extensions.prf.results?.second
++                      ? { second: Fido2Utils.stringToArray(result.extensions.prf.results?.second) }
++                      : undefined),
++                  }
++                : undefined,
++            }
++          : undefined,
++      }),
+       authenticatorAttachment: "platform",
+       toJSON: () => Fido2Utils.getResultToJson(result),
+     } as PublicKeyCredential;
+diff --git a/apps/desktop/src/autofill/services/desktop-autofill.service.ts b/apps/desktop/src/autofill/services/desktop-autofill.service.ts
+index b84720bb3c..1b48df6e81 100644
+--- a/apps/desktop/src/autofill/services/desktop-autofill.service.ts
++++ b/apps/desktop/src/autofill/services/desktop-autofill.service.ts
+@@ -395,7 +395,11 @@ export class DesktopAutofillService implements OnDestroy {
+       rpId: request.rpId,
+       hash: new Uint8Array(request.clientDataHash),
+       allowCredentialDescriptorList: allowedCredentials,
+-      extensions: {},
++      extensions: {
++        prf: {
++          enabled: true,
++        },
++      },
+       requireUserVerification:
+         request.userVerification === "required" || request.userVerification === "preferred",
+       fallbackSupported: false,
+diff --git a/libs/common/src/platform/abstractions/fido2/fido2-authenticator.service.abstraction.ts b/libs/common/src/platform/abstractions/fido2/fido2-authenticator.service.abstraction.ts
+index a4a75d277b..29545131a5 100644
+--- a/libs/common/src/platform/abstractions/fido2/fido2-authenticator.service.abstraction.ts
++++ b/libs/common/src/platform/abstractions/fido2/fido2-authenticator.service.abstraction.ts
+@@ -107,6 +107,7 @@ export interface Fido2AuthenticatorMakeCredentialsParams {
+     appidExclude?: string;
+     credProps?: boolean;
+     uvm?: boolean;
++    prf?: AuthenticationExtensionsPRFInputs;
+   };
+   /** A Boolean value that indicates that individually-identifying attestation MAY be returned by the authenticator. */
+   enterpriseAttestationPossible?: boolean; // Ignored by bitwarden at the moment
+@@ -125,6 +126,9 @@ export interface Fido2AuthenticatorMakeCredentialResult {
+   authData: Uint8Array<ArrayBuffer>;
+   publicKey: Uint8Array<ArrayBuffer>;
+   publicKeyAlgorithm: number;
++  extensions?: {
++    prf?: AuthenticationExtensionsPRFOutputs;
++  };
+ }
+ 
+ /**
+@@ -143,7 +147,10 @@ export interface Fido2AuthenticatorGetAssertionParams {
+   requireUserVerification: boolean;
+   /** The constant Boolean value true. It is included here as a pseudo-parameter to simplify applying this abstract authenticator model to implementations that may wish to make a test of user presence optional although WebAuthn does not. */
+   // requireUserPresence: boolean; // Always required
+-  extensions: unknown;
++  /** A map from extension identifiers to their authenticator extension inputs, created by the client based on the extensions requested by the Relying Party, if any. */
++  extensions?: {
++    prf?: AuthenticationExtensionsPRFInputs;
++  };
+   /** Forwarded to user interface */
+   fallbackSupported: boolean;
+ 
+@@ -158,4 +165,38 @@ export interface Fido2AuthenticatorGetAssertionResult {
+   };
+   authenticatorData: Uint8Array<ArrayBuffer>;
+   signature: Uint8Array<ArrayBuffer>;
++  extensions?: {
++    prf?: AuthenticationExtensionsPRFOutputs;
++  };
++}
++
++/**
++ * This interface represents the input parameters described in
++ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfvalues
++ */
++export interface AuthenticationExtensionsPRFValues {
++  first: BufferSource;
++  second?: BufferSource;
++}
++
++/**
++ * This interface represents the input parameters described in
++ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfoutputs
++ */
++export interface AuthenticationExtensionsPRFOutputs {
++  /** true if, and only if, the PRF is available for use with the created credential. This is only reported during registration and is not present in the case of authentication. */
++  enabled?: boolean;
++  /** The results of evaluating the PRF for the inputs given in eval or evalByCredential. Outputs may not be available during registration; see comments in eval. */
++  results?: AuthenticationExtensionsPRFValues;
++}
++
++/**
++ * This interface represents the input parameters described in
++ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfinputs
++ */
++export interface AuthenticationExtensionsPRFInputs {
++  eval?: AuthenticationExtensionsPRFValues;
++  evalByCredential?: {
++    [index: string]: AuthenticationExtensionsPRFValues;
++  };
+ }
+diff --git a/libs/common/src/platform/abstractions/fido2/fido2-client.service.abstraction.ts b/libs/common/src/platform/abstractions/fido2/fido2-client.service.abstraction.ts
+index 058537af06..1ad1694fc6 100644
+--- a/libs/common/src/platform/abstractions/fido2/fido2-client.service.abstraction.ts
++++ b/libs/common/src/platform/abstractions/fido2/fido2-client.service.abstraction.ts
+@@ -86,6 +86,7 @@ export interface CreateCredentialParams {
+     appidExclude?: string; // Not supported
+     uvm?: boolean; // Not supported
+     credProps?: boolean;
++    prf?: AuthenticationExtensionsPRFInputsJSON;
+   };
+   /**
+    * This member contains information about the desired properties of the credential to be created.
+@@ -128,6 +129,7 @@ export interface CreateCredentialResult {
+     credProps?: {
+       rk: boolean;
+     };
++    prf?: AuthenticationExtensionsPRFOutputsJSON;
+   };
+ }
+ 
+@@ -144,6 +146,9 @@ export interface AssertCredentialParams {
+   sameOriginWithAncestors: boolean;
+   mediation?: "silent" | "optional" | "required" | "conditional";
+   fallbackSupported: boolean;
++  extensions?: {
++    prf?: AuthenticationExtensionsPRFInputsJSON;
++  };
+ }
+ 
+ /**
+@@ -155,6 +160,9 @@ export interface AssertCredentialResult {
+   authenticatorData: string;
+   signature: string;
+   userHandle: string;
++  extensions?: {
++    prf?: AuthenticationExtensionsPRFOutputsJSON;
++  };
+ }
+ 
+ /**
+@@ -179,3 +187,34 @@ export class FallbackRequestedError extends Error {
+     super("FallbackRequested");
+   }
+ }
++
++/**
++ * This interface represents the input parameters described in
++ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfvaluesjson
++ */
++export interface AuthenticationExtensionsPRFValuesJSON {
++  first: string;
++  second?: string;
++}
++
++/**
++ * This interface represents the input parameters described in
++ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfoutputsjson
++ */
++export interface AuthenticationExtensionsPRFOutputsJSON {
++  /** true if, and only if, the PRF is available for use with the created credential. This is only reported during registration and is not present in the case of authentication. */
++  enabled?: boolean;
++  /** The results of evaluating the PRF for the inputs given in eval or evalByCredential. Outputs may not be available during registration; see comments in eval. */
++  results?: AuthenticationExtensionsPRFValuesJSON;
++}
++
++/**
++ * This interface represents the input parameters described in
++ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfinputsjson
++ */
++export interface AuthenticationExtensionsPRFInputsJSON {
++  eval?: AuthenticationExtensionsPRFValuesJSON;
++  evalByCredential?: {
++    [index: string]: AuthenticationExtensionsPRFValuesJSON;
++  };
++}
+diff --git a/libs/common/src/platform/services/fido2/fido2-authenticator.service.ts b/libs/common/src/platform/services/fido2/fido2-authenticator.service.ts
+index 4c9c7785df..351278d38a 100644
+--- a/libs/common/src/platform/services/fido2/fido2-authenticator.service.ts
++++ b/libs/common/src/platform/services/fido2/fido2-authenticator.service.ts
+@@ -40,6 +40,131 @@ export const AAGUID = new Uint8Array([
+ 
+ const KeyUsages: KeyUsage[] = ["sign"];
+ 
++// FIXME: hacky workaround until extension data are supported by the sdk
++async function hmacCredentialsShim(
++  fido2Credential: Fido2CredentialView,
++): Promise<Fido2CredentialView> {
++  // deterministically derive creds from secret key value
++  const keyBuffer = Fido2Utils.stringToArray(fido2Credential.keyValue);
++  const keyValue = await crypto.subtle.importKey(
++    "pkcs8",
++    new Uint8Array(keyBuffer),
++    {
++      name: fido2Credential.keyAlgorithm,
++      namedCurve: fido2Credential.keyCurve,
++    } as EcKeyImportParams,
++    true,
++    KeyUsages,
++  );
++
++  const privateKeyJwk = await crypto.subtle.exportKey("jwk", keyValue);
++  const hmacSecret = await crypto.subtle.importKey(
++    "raw",
++    Fido2Utils.bufferSourceToUint8Array(Fido2Utils.stringToArray(privateKeyJwk.d)),
++    { name: "HKDF" },
++    false,
++    ["deriveBits"],
++  );
++  const hmacCreds = await Promise.all(
++    [
++      new Uint8Array([99, 114, 101, 100, 87, 105, 116, 104, 85, 118]), // credWithUv
++      new Uint8Array([99, 114, 101, 100, 87, 105, 116, 104, 111, 117, 116, 85, 118]), // credWithoutUv
++    ].map((info) =>
++      crypto.subtle.deriveBits(
++        {
++          name: "HKDF",
++          hash: "SHA-512",
++          salt: Fido2Utils.bufferSourceToUint8Array(
++            parseCredentialId(fido2Credential.credentialId),
++          ),
++          info: info,
++        } as HkdfParams,
++        hmacSecret,
++        256,
++      ),
++    ),
++  );
++
++  fido2Credential.fido2Extensions = {
++    hmacCredentials: {
++      algorithm: "hmac-sha256",
++      credWithUV: Fido2Utils.arrayToString(new Uint8Array(hmacCreds[0])),
++      credWithoutUV: Fido2Utils.arrayToString(new Uint8Array(hmacCreds[1])),
++    },
++  };
++
++  return fido2Credential;
++}
++
++async function computePRF(
++  fido2Credential: Fido2CredentialView,
++  params: AuthenticationExtensionsPRFInputs,
++  userVerified: boolean,
++): Promise<AuthenticationExtensionsPRFValues> {
++  // 3. Initialize the prf extension output to an empty dictionary.
++  const output = {} as AuthenticationExtensionsPRFValues;
++
++  // 4. Let ev be null, and try to find any applicable PRF input(s):
++  // a. If evalByCredential is present and contains an entry whose key is the base64url encoding of the credential ID that will be returned, let ev be the value of that entry.
++  // b. If ev is null and eval is present, then let ev be the value of eval.
++  const id = Fido2Utils.arrayToString(parseCredentialId(fido2Credential.credentialId));
++  const ev = params?.evalByCredential?.[id] ?? params?.eval ?? null;
++  let salt1, salt2;
++
++  // 5. If ev is not null:
++  if (ev) {
++    const webAuthnPRFPrefix = new Uint8Array([
++      0x57, 0x65, 0x62, 0x41, 0x75, 0x74, 0x68, 0x6e, 0x20, 0x50, 0x52, 0x46, 0x00,
++    ]);
++
++    // a. Let salt1 be the value of SHA-256(UTF8Encode("WebAuthn PRF") || 0x00 || ev.first).
++    const input = new Uint8Array(13 + ev.first.byteLength);
++    input.set(webAuthnPRFPrefix, 0);
++    input.set(Fido2Utils.bufferSourceToUint8Array(ev.first), 13);
++
++    salt1 = new Uint8Array(await crypto.subtle.digest({ name: "SHA-256" }, input));
++
++    // b. If ev.second is present, let salt2 be the value of SHA-256(UTF8Encode("WebAuthn PRF") || 0x00 || ev.second).
++    if (ev.second) {
++      const input = new Uint8Array(13 + ev.second.byteLength);
++      input.set(webAuthnPRFPrefix, 0);
++      input.set(Fido2Utils.bufferSourceToUint8Array(ev.second), 13);
++
++      salt2 = new Uint8Array(await crypto.subtle.digest({ name: "SHA-256" }, input));
++    }
++
++    // c. If the authenticator supports the CTAP2 hmac-secret extension [FIDO-CTAP]:
++    //  i) Send an hmac-secret extension to the authenticator using the values of salt1 and, if set, salt2 as the parameters of the same name in that process.
++    //  ii) Decrypt the extension result and set results to the PRF result(s), if any.
++    // d. If the authenticator does not support the CTAP2 hmac-secret extension [FIDO-CTAP], but does support some other implementation compatible with the abstract authenticator processing defined below:
++    // i) Use some unspecified mechanism to convey salt1 and, if defined, salt2 to the authenticator as PRF inputs, in that order.
++    // ii) Use some unspecified mechanism to receive the PRF outputs from the authenticator as an AuthenticationExtensionsPRFValues value results. Set results to results.
++
++    // todo respect key algorithm
++    const hmacKey = await crypto.subtle.importKey(
++      "raw",
++      Fido2Utils.stringToArray(
++        userVerified
++          ? fido2Credential.fido2Extensions.hmacCredentials.credWithUV
++          : fido2Credential.fido2Extensions.hmacCredentials.credWithoutUV,
++      ),
++      { name: "HMAC", hash: "SHA-256" },
++      false,
++      KeyUsages,
++    );
++
++    // output1: HMAC-SHA-256(CredRandom, salt1)
++    output.first = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, salt1));
++
++    // output2: HMAC-SHA-256(CredRandom, salt2)
++    if (salt2) {
++      output.second = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, salt2));
++    }
++  }
++
++  return output;
++}
++
+ /**
+  * Bitwarden implementation of the WebAuthn Authenticator Model as described by W3C
+  * https://www.w3.org/TR/webauthn-3/#sctn-authenticator-model
+@@ -145,6 +270,12 @@ export class Fido2AuthenticatorService<
+         throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.NotAllowed);
+       }
+ 
++      // Client extension processing (registration)
++      // 1. If evalByCredential is present, return a DOMException whose name is “NotSupportedError”.
++      if (params.extensions?.prf?.evalByCredential) {
++        throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.NotSupported);
++      }
++
+       try {
+         keyPair = await createKeyPair();
+         pubKeyDer = new Uint8Array(await crypto.subtle.exportKey("spki", keyPair.publicKey));
+@@ -212,12 +343,25 @@ export class Fido2AuthenticatorService<
+         }),
+       );
+ 
++      let prfResults;
++      if (params.extensions?.prf) {
++        prfResults = await computePRF(fido2Credential, params.extensions?.prf, userVerified);
++      }
++
+       return {
+         credentialId: parseCredentialId(credentialId),
+         attestationObject,
+         authData,
+         publicKey: pubKeyDer,
+         publicKeyAlgorithm: -7,
++        extensions: {
++          prf: prfResults
++            ? {
++                enabled: !!params?.extensions?.prf,
++                results: prfResults,
++              }
++            : undefined,
++        },
+       };
+     } finally {
+       userInterfaceSession.close();
+@@ -309,9 +453,47 @@ export class Fido2AuthenticatorService<
+         throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.NotAllowed);
+       }
+ 
++      // Client extension processing (authentication)
++      // 1. If evalByCredential is not empty but allowCredentials is empty, return a DOMException whose name is “NotSupportedError”.
++      if (
++        Object.keys(params.extensions?.prf?.evalByCredential ?? {}).length &&
++        !params.allowCredentialDescriptorList?.length
++      ) {
++        // todo: probably better to add a custom error type here, instead of using DOMException?
++        throw new DOMException(
++          "'prf' extension has 'evalByCredential' with an empty allow list",
++          "NotSupportedError",
++        );
++      }
++
++      // 2. If any key in evalByCredential is the empty string, or is not a valid base64url encoding, or does not equal the id of some element of allowCredentials after performing base64url decoding, then return a DOMException whose name is “SyntaxError”.
++      if (
++        Object.keys(params.extensions?.prf?.evalByCredential ?? {}).some((k) => {
++          if (!k) {
++            return true;
++          }
++
++          try {
++            Fido2Utils.stringToArray(k);
++            return !params.allowCredentialDescriptorList.some(
++              (e) => Fido2Utils.arrayToString(e.id) === k,
++            );
++          } catch {
++            return true;
++          }
++        })
++      ) {
++        // todo: probably better to add a custom error type here, instead of using DOMException?
++        throw new DOMException(
++          "'prf' extension contains 'evalByCredential' key that doesn't match any in allowedCredentials",
++          "SyntaxError",
++        );
++      }
++
+       try {
+         const selectedFido2Credential = selectedCipher.login.fido2Credentials[0];
+         const selectedCredentialId = selectedFido2Credential.credentialId;
++        await hmacCredentialsShim(selectedFido2Credential);
+ 
+         if (selectedFido2Credential.counter > 0) {
+           ++selectedFido2Credential.counter;
+@@ -343,6 +525,15 @@ export class Fido2AuthenticatorService<
+           privateKey: await getPrivateKeyFromFido2Credential(selectedFido2Credential),
+         });
+ 
++        let prfResults;
++        if (params.extensions?.prf) {
++          prfResults = await computePRF(
++            selectedFido2Credential,
++            params.extensions?.prf,
++            userVerified,
++          );
++        }
++
+         return {
+           authenticatorData,
+           selectedCredential: {
+@@ -350,6 +541,9 @@ export class Fido2AuthenticatorService<
+             userHandle: Fido2Utils.stringToArray(selectedFido2Credential.userHandle),
+           },
+           signature,
++          extensions: {
++            prf: prfResults ? { results: prfResults } : undefined,
++          },
+         };
+       } catch (error) {
+         this.logService?.error(
+@@ -501,6 +695,18 @@ async function createKeyView(
+   fido2Credential.discoverable = params.requireResidentKey;
+   fido2Credential.creationDate = new Date();
+ 
++  await hmacCredentialsShim(fido2Credential);
++  // FIXME: potentially replace with independent random seeds, once sdk is able to persist these
++  /*
++  fido2Credential.fido2Extensions = {
++    hmacCredentials: {
++      algorithm: "hmac-sha256",
++      credWithUV: Fido2Utils.arrayToString(crypto.getRandomValues(new Uint8Array(32))),
++      credWithoutUV: Fido2Utils.arrayToString(crypto.getRandomValues(new Uint8Array(32))),
++    }
++  };
++  */
++
+   return fido2Credential;
+ }
+ 
+diff --git a/libs/common/src/platform/services/fido2/fido2-client.service.ts b/libs/common/src/platform/services/fido2/fido2-client.service.ts
+index b80023b8bc..be07fd454e 100644
+--- a/libs/common/src/platform/services/fido2/fido2-client.service.ts
++++ b/libs/common/src/platform/services/fido2/fido2-client.service.ts
+@@ -252,6 +252,37 @@ export class Fido2ClientService<
+       };
+     }
+ 
++    let prf;
++    if (params.extensions?.prf) {
++      prf = makeCredentialResult.extensions?.prf
++        ? {
++            enabled: makeCredentialResult.extensions.prf?.enabled,
++            results: makeCredentialResult.extensions.prf?.results
++              ? {
++                  ...(makeCredentialResult.extensions.prf.results?.first
++                    ? {
++                        first: Fido2Utils.arrayToString(
++                          Fido2Utils.bufferSourceToUint8Array(
++                            makeCredentialResult.extensions.prf.results?.first,
++                          ),
++                        ),
++                      }
++                    : null),
++                  ...(makeCredentialResult.extensions.prf.results?.second
++                    ? {
++                        second: Fido2Utils.arrayToString(
++                          Fido2Utils.bufferSourceToUint8Array(
++                            makeCredentialResult.extensions.prf.results?.second,
++                          ),
++                        ),
++                      }
++                    : null),
++                }
++              : undefined,
++          }
++        : undefined;
++    }
++
+     timeoutSubscription?.unsubscribe();
+ 
+     return {
+@@ -262,7 +293,7 @@ export class Fido2ClientService<
+       publicKey: Fido2Utils.arrayToString(makeCredentialResult.publicKey),
+       publicKeyAlgorithm: makeCredentialResult.publicKeyAlgorithm,
+       transports: ["internal", "hybrid"],
+-      extensions: { credProps },
++      extensions: { credProps, prf },
+     };
+   }
+ 
+@@ -362,6 +393,10 @@ export class Fido2ClientService<
+         throw new DOMException("Unknown error occured.", "InvalidStateError");
+       }
+ 
++      if (error instanceof DOMException) {
++        throw error;
++      }
++
+       this.logService?.info(`[Fido2Client] Aborted by user: ${error}`);
+       throw new DOMException(
+         "The operation either timed out or was not allowed.",
+@@ -452,6 +487,35 @@ export class Fido2ClientService<
+           ? Fido2Utils.arrayToString(getAssertionResult.selectedCredential.userHandle)
+           : undefined,
+       signature: Fido2Utils.arrayToString(getAssertionResult.signature),
++      extensions: {
++        prf: getAssertionResult.extensions?.prf
++          ? {
++              enabled: getAssertionResult.extensions.prf?.enabled,
++              results: getAssertionResult.extensions.prf?.results
++                ? {
++                    ...(getAssertionResult.extensions.prf.results?.first
++                      ? {
++                          first: Fido2Utils.arrayToString(
++                            Fido2Utils.bufferSourceToUint8Array(
++                              getAssertionResult.extensions.prf.results?.first,
++                            ),
++                          ),
++                        }
++                      : null),
++                    ...(getAssertionResult.extensions.prf.results?.second
++                      ? {
++                          second: Fido2Utils.arrayToString(
++                            Fido2Utils.bufferSourceToUint8Array(
++                              getAssertionResult.extensions.prf.results?.second,
++                            ),
++                          ),
++                        }
++                      : null),
++                  }
++                : undefined,
++            }
++          : undefined,
++      },
+     };
+   }
+ 
+@@ -529,6 +593,33 @@ function mapToMakeCredentialParams({
+       displayName: params.user.displayName,
+       name: params.user.name,
+     },
++    extensions: {
++      prf: params.extensions?.prf
++        ? {
++            eval: params.extensions.prf?.eval
++              ? {
++                  ...(params.extensions.prf.eval?.first
++                    ? { first: Fido2Utils.stringToArray(params.extensions.prf.eval?.first) }
++                    : undefined),
++                  ...(params.extensions.prf.eval?.second
++                    ? { second: Fido2Utils.stringToArray(params.extensions.prf.eval?.second) }
++                    : undefined),
++                }
++              : undefined,
++            evalByCredential: params.extensions.prf?.evalByCredential
++              ? Object.fromEntries(
++                  Object.entries(params.extensions.prf.evalByCredential).map(([k, v]) => [
++                    k,
++                    {
++                      ...(v?.first ? { first: Fido2Utils.stringToArray(v?.first) } : undefined),
++                      ...(v?.second ? { second: Fido2Utils.stringToArray(v?.second) } : undefined),
++                    },
++                  ]),
++                )
++              : undefined,
++          }
++        : undefined,
++    },
+     fallbackSupported: params.fallbackSupported,
+   };
+ }
+@@ -561,7 +652,33 @@ function mapToGetAssertionParams({
+     requireUserVerification,
+     hash: clientDataHash,
+     allowCredentialDescriptorList,
+-    extensions: {},
++    extensions: {
++      prf: params.extensions?.prf
++        ? {
++            eval: params.extensions.prf?.eval
++              ? {
++                  ...(params.extensions.prf.eval?.first
++                    ? { first: Fido2Utils.stringToArray(params.extensions.prf.eval?.first) }
++                    : undefined),
++                  ...(params.extensions.prf.eval?.second
++                    ? { second: Fido2Utils.stringToArray(params.extensions.prf.eval?.second) }
++                    : undefined),
++                }
++              : undefined,
++            evalByCredential: params.extensions.prf?.evalByCredential
++              ? Object.fromEntries(
++                  Object.entries(params.extensions.prf.evalByCredential).map(([k, v]) => [
++                    k,
++                    {
++                      ...(v?.first ? { first: Fido2Utils.stringToArray(v?.first) } : undefined),
++                      ...(v?.second ? { second: Fido2Utils.stringToArray(v?.second) } : undefined),
++                    },
++                  ]),
++                )
++              : undefined,
++          }
++        : undefined,
++    },
+     fallbackSupported: params.fallbackSupported,
+     assumeUserPresence,
+   };
+diff --git a/libs/common/src/vault/models/view/fido2-credential.view.ts b/libs/common/src/vault/models/view/fido2-credential.view.ts
+index 19e7f5d7e3..ebffeff495 100644
+--- a/libs/common/src/vault/models/view/fido2-credential.view.ts
++++ b/libs/common/src/vault/models/view/fido2-credential.view.ts
+@@ -7,6 +7,18 @@ import {
+ 
+ import { ItemView } from "./item.view";
+ 
++// based on https://fidoalliance.org/specs/cx/cxf-v1.0-rd-20250313.html#dict-fido2-hmac-credentials
++export class Fido2HmacCredentials {
++  algorithm: string;
++  credWithUV: string;
++  credWithoutUV: string;
++}
++
++// based on https://fidoalliance.org/specs/cx/cxf-v1.0-rd-20250313.html#dict-fido2-extensions
++export class Fido2Extensions {
++  hmacCredentials?: Fido2HmacCredentials;
++}
++
+ export class Fido2CredentialView extends ItemView {
+   credentialId!: string;
+   keyType!: "public-key";
+@@ -19,6 +31,7 @@ export class Fido2CredentialView extends ItemView {
+   counter!: number;
+   rpName?: string;
+   userDisplayName?: string;
++  fido2Extensions?: Fido2Extensions;
+   discoverable: boolean = false;
+   creationDate!: Date;
+ 
+@@ -34,6 +47,7 @@ export class Fido2CredentialView extends ItemView {
+     counter: number;
+     rpName?: string;
+     userDisplayName?: string;
++    fido2Extensions?: Fido2Extensions;
+     discoverable?: boolean;
+     creationDate: Date;
+   }) {
+@@ -52,6 +66,7 @@ export class Fido2CredentialView extends ItemView {
+     this.counter = f.counter;
+     this.rpName = f.rpName;
+     this.userDisplayName = f.userDisplayName;
++    this.fido2Extensions = f.fido2Extensions;
+     this.discoverable = f.discoverable ?? false;
+     this.creationDate = f.creationDate;
+   }
+-- 
+2.53.0.windows.2
+

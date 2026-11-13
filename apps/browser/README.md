@@ -19,3 +19,26 @@ The Bitwarden browser extension is written using the Web Extension API and Angul
 ## Documentation
 
 Please refer to the [Browser section](https://contributing.bitwarden.com/getting-started/clients/browser/) of the [Contributing Documentation](https://contributing.bitwarden.com/) for build instructions, recommended tooling, code style tips, and lots of other great information to get you started.
+
+## Signing this Firefox fork
+
+Stable Firefox builds use the extension ID `{dbc1291d-eb8c-4534-8653-535bea12bab2}`
+in both manifest templates, allowing submission under a separate Mozilla Add-ons
+account. Keep this ID unchanged for subsequent updates. This is a separate
+installation from the official extension and does not inherit its local settings.
+Official Bitwarden desktop native messaging does not allow this ID, so desktop
+integration is unavailable without a separately configured native messaging host.
+Beta builds still use the upstream beta ID and are not covered by these instructions.
+
+To reproduce the production Manifest V2 build, use Windows with Node.js 24.19.0
+and npm 11.17.0. From the repository root, run:
+
+```powershell
+npm ci
+npm run build:prod:firefox --workspace @bitwarden/browser
+```
+
+The generated extension is in `apps/browser/build`. Submit that directory using
+`web-ext sign --channel=unlisted`, along with matching source code and these build
+instructions. Supply credentials through `WEB_EXT_API_KEY` (JWT issuer) and
+`WEB_EXT_API_SECRET` (JWT secret); do not put them in source files.
