@@ -1,0 +1,353 @@
+name: Release Patched Browser
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Stable browser release tag (blank selects the latest)"
+        required: false
+        type: string
+
+concurrency:
+  group: release-patched-browser
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Sync upstream and prepare patched tag
+    if: >-
+      github.repository == 'kazenshi/clients' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.release.outputs.build }}
+      upstream_tag: ${{ steps.release.outputs.upstream_tag }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      source_sha: ${{ steps.patch.outputs.source_sha }}
+    steps:
+      - name: Require token capable of syncing upstream workflows
+        env:
+          SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          if [[ -z "$SYNC_TOKEN" ]]; then
+            echo "::error::Set FORK_SYNC_TOKEN to a token for this fork with Contents and Workflows read/write permissions."
+            exit 1
+          fi
+
+      - name: Check out fork default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Rebase fork commits onto upstream main
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/bitwarden/clients.git
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Fork already contains upstream main."
+            exit 0
+          fi
+          fork_sha=$(git rev-parse HEAD)
+          if ! git rebase FETCH_HEAD; then
+            git rebase --abort
+            echo "::error::Fork commits conflict with upstream main. Rebase them manually and force push."
+            exit 1
+          fi
+          # The lease refuses to overwrite fork commits pushed while this job was running.
+          git push --force-with-lease="refs/heads/$DEFAULT_BRANCH:$fork_sha" origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+
+      - name: Select upstream browser release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            if [[ ! "$REQUESTED_TAG" =~ ^browser-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Expected a stable browser-vYYYY.M.N release tag."
+              exit 1
+            fi
+            upstream_tag=$(gh api "repos/bitwarden/clients/releases/tags/$REQUESTED_TAG" \
+              --jq 'select(.draft == false and .prerelease == false) | .tag_name')
+          else
+            upstream_tag=$(gh api --paginate 'repos/bitwarden/clients/releases?per_page=100' |
+              jq -sr 'add | map(select(.draft == false and .prerelease == false and
+                (.tag_name | test("^browser-v[0-9]+[.][0-9]+[.][0-9]+$")))) |
+                max_by(.published_at) | .tag_name')
+          fi
+          if [[ ! "$upstream_tag" =~ ^browser-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::No matching published stable browser release was found."
+            exit 1
+          fi
+
+          release_tag="$upstream_tag-prf"
+          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -sr --arg tag "$release_tag" 'add | any(.tag_name == $tag and .draft == false)')
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          if [[ "$published" == "true" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Already published $release_tag; nothing to rebuild." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply patch to the exact upstream release
+        id: patch
+        if: steps.release.outputs.build == 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.release.outputs.upstream_tag }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          patch_file="$RUNNER_TEMP/prf.patch"
+          cp 0001-add-proof-of-concept-prf-support-for-passkeys.patch "$patch_file"
+          git fetch --no-tags upstream "refs/tags/$UPSTREAM_TAG"
+          upstream_sha=$(git rev-parse 'FETCH_HEAD^{commit}')
+          git switch --detach "$upstream_sha"
+          git apply --check --index "$patch_file"
+          git apply --index "$patch_file"
+          expected_tree=$(git write-tree)
+
+          # A failed build may already have pushed its tag. Never move a published source tag.
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            if [[ "$(git rev-parse "$RELEASE_TAG^{tree}")" != "$expected_tree" ||
+                  "$(git show -s --format=%P "$RELEASE_TAG^{commit}")" != "$upstream_sha" ]]; then
+              echo "::error::$RELEASE_TAG exists with different sources. Do not overwrite it; investigate the patch or upstream tag."
+              exit 1
+            fi
+            source_sha=$(git rev-parse "$RELEASE_TAG^{commit}")
+          else
+            git commit -m "Apply PRF proof-of-concept patch to $UPSTREAM_TAG [skip ci]" \
+              -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+            source_sha=$(git rev-parse HEAD)
+            git tag "$RELEASE_TAG" "$source_sha"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "Building $RELEASE_TAG from patched commit $source_sha." >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build unsigned ${{ matrix.browser }} extension
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chrome, edge, firefox, opera]
+    steps:
+      - name: Check out immutable patched source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Set up upstream Node version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Remove commercial SDK for the open-source build
+        run: rm -rf node_modules/@bitwarden/commercial-sdk-internal
+
+      - name: Build production extension without signing
+        env:
+          BROWSER_TARGET: ${{ matrix.browser }}
+        run: npm run "dist:$BROWSER_TARGET" --workspace @bitwarden/browser
+
+      - name: Validate and name extension archive
+        env:
+          BROWSER_TARGET: ${{ matrix.browser }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          archive="apps/browser/dist/oss-dist-$BROWSER_TARGET.zip"
+          if [[ ! -s "$archive" ]]; then
+            echo "::error::Expected browser build archive at $archive."
+            exit 1
+          fi
+          unzip -t "$archive"
+          unzip -p "$archive" manifest.json > "$RUNNER_TEMP/manifest.json"
+          node -e '
+            const fs = require("node:fs");
+            const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const expected = process.env.RELEASE_TAG.match(/^browser-v(.+)-prf$/)[1];
+            if (manifest.version !== expected) {
+              throw new Error(`Manifest version ${manifest.version} does not match ${expected}`);
+            }
+          ' "$RUNNER_TEMP/manifest.json"
+          mkdir release-assets
+          cp "$archive" "release-assets/$RELEASE_TAG-$BROWSER_TARGET-unsigned.zip"
+
+      - name: Upload unsigned extension
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-${{ matrix.browser }}
+          path: release-assets/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish only after every browser builds
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+    steps:
+      - name: Check out packaging script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Download unsigned extensions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: unsigned-*
+          merge-multiple: true
+          path: build-zips
+
+      - name: Package browser installers
+        env:
+          CRX_PRIVATE_KEY: ${{ secrets.CRX_PRIVATE_KEY }}
+        run: |
+          key="$RUNNER_TEMP/crx-key.pem"
+          if [[ -n "$CRX_PRIVATE_KEY" ]]; then
+            printf '%s\n' "$CRX_PRIVATE_KEY" > "$key"
+            key_note="Signed with the repository CRX_PRIVATE_KEY, so the extension ID stays stable across releases."
+          else
+            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$key" 2> /dev/null
+            key_note="Signed with a one-time key, so this release has its own extension ID."
+          fi
+          chmod 600 "$key"
+
+          mkdir release-assets
+          for browser in chrome edge opera; do
+            zip="build-zips/$RELEASE_TAG-$browser-unsigned.zip"
+            unzip -tq "$zip"
+            id=$(node .github/scripts/pack-crx3.mjs "$key" "$zip" "release-assets/$RELEASE_TAG-$browser.crx")
+            echo "$browser extension ID: $id" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          rm -f "$key"
+          echo "CRX_KEY_NOTE=$key_note" >> "$GITHUB_ENV"
+
+          unzip -tq "build-zips/$RELEASE_TAG-firefox-unsigned.zip"
+          cp "build-zips/$RELEASE_TAG-firefox-unsigned.zip" "release-assets/$RELEASE_TAG-firefox-unsigned.xpi"
+
+          cd release-assets
+          for asset in "$RELEASE_TAG"-{chrome,edge,opera}.crx "$RELEASE_TAG-firefox-unsigned.xpi"; do
+            test -s "$asset"
+          done
+          sha256sum ./*.crx ./*.xpi > SHA256SUMS.txt
+
+      - name: Create or resume draft release and publish
+        run: |
+          exists=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -sr --arg tag "$RELEASE_TAG" 'add | any(.tag_name == $tag)')
+          if [[ "$exists" == "true" ]]; then
+            draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+            if [[ "$draft" != "true" ]]; then
+              echo "::error::Refusing to overwrite published release $RELEASE_TAG."
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --draft --title "$UPSTREAM_TAG + PRF patch"
+          fi
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Unofficial open-source browser extensions built from [Bitwarden $UPSTREAM_TAG](https://github.com/bitwarden/clients/releases/tag/$UPSTREAM_TAG)
+          with \`0001-add-proof-of-concept-prf-support-for-passkeys.patch\` applied.
+
+          Patched source commit: [$SOURCE_SHA](https://github.com/$GITHUB_REPOSITORY/commit/$SOURCE_SHA).
+          The release tag points to the exact patched sources used for all four builds.
+          Fork default-branch changes other than the patch are not included.
+
+          Assets:
+          - \`.crx\` packages for Chrome, Edge, and Opera (self-signed, not from any web store). $CRX_KEY_NOTE
+          - An unsigned \`.xpi\` for Firefox (Manifest V2), not signed by Mozilla.
+          - \`SHA256SUMS.txt\` checksums.
+
+          ## Installing
+
+          ### 1. Extract the extension into a permanent folder
+
+          Chrome, Edge, and Opera load unpacked extensions from a folder on disk every time they start,
+          so extract into a folder you will keep, for example:
+
+          - Windows: \`%USERPROFILE%\\Extensions\\bitwarden-prf\\<browser>\`
+          - macOS / Linux: \`~/Extensions/bitwarden-prf/<browser>\`
+
+          Do not delete or move the folder afterwards or the browser will disable the extension.
+          A \`.crx\` is a ZIP with a signature header and a \`.xpi\` is a plain ZIP. Extract either one with:
+
+          - **Windows (PowerShell):**
+            \`\`\`powershell
+            \$dir = "\$env:USERPROFILE\\Extensions\\bitwarden-prf\\chrome"
+            New-Item -ItemType Directory -Force \$dir
+            tar -xf .\\$RELEASE_TAG-chrome.crx -C \$dir
+            \`\`\`
+            Use \`tar\`, which is built into Windows 10 and later. \`Expand-Archive\` cannot read \`.crx\` files.
+            7-Zip (**7-Zip > Extract to...**) also works.
+          - **macOS:** \`mkdir -p ~/Extensions/bitwarden-prf/chrome && tar -xf $RELEASE_TAG-chrome.crx -C ~/Extensions/bitwarden-prf/chrome\`
+          - **Linux:** \`mkdir -p ~/Extensions/bitwarden-prf/chrome && unzip $RELEASE_TAG-chrome.crx -d ~/Extensions/bitwarden-prf/chrome\`
+            (\`unzip\` warns about extra bytes at the beginning of a \`.crx\`; the warning is expected.)
+
+          Replace \`chrome\` with \`edge\`, \`opera\`, or \`firefox\` (using \`$RELEASE_TAG-firefox-unsigned.xpi\`) as needed.
+          The folder is correct when \`manifest.json\` sits directly inside it.
+
+          ### 2. Load it into your browser
+
+          - **Chrome:** open \`chrome://extensions/\`, turn on **Developer mode**, click **Load unpacked**, and select the extracted folder.
+          - **Edge:** open \`edge://extensions/\`, turn on **Developer mode**, click **Load unpacked**, and select the extracted folder.
+          - **Opera:** open \`opera://extensions\`, turn on **Developer mode**, click **Load unpacked**, and select the extracted folder.
+          - **Firefox (regular release):** Firefox only installs Mozilla-signed add-ons permanently. Open \`about:debugging\`,
+            click **This Firefox > Load Temporary Add-on...**, and select the \`.xpi\` (or \`manifest.json\` in the extracted folder).
+            Temporary add-ons are removed when Firefox restarts, so repeat this after each restart.
+          - **Firefox Developer Edition:** open \`about:config\` and set \`xpinstall.signatures.required\` to \`false\`.
+            Then open \`about:addons\`, click the gear icon, choose **Install Add-on From File...**, and select the \`.xpi\`.
+            No extraction is needed, and the add-on stays installed across restarts.
+
+          The Firefox package keeps the official Bitwarden add-on ID, so installing it can replace an installed official add-on.
+
+          ### Updating
+
+          Chrome, Edge, and Opera: delete the contents of the extension folder, extract the new release into the same folder,
+          then click the reload button on the extension's card in the extensions page. Keeping the same folder keeps the same
+          extension ID, so your login and settings are preserved. Firefox Developer Edition: install the new \`.xpi\` the same way.
+
+          These are not official Bitwarden releases. Back up your data before replacing an existing installation.
+          The PRF patch is a proof of concept; use at your own risk.
+          EOF
+
+          gh release upload "$RELEASE_TAG" release-assets/*.crx release-assets/*.xpi release-assets/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" --draft=false
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
