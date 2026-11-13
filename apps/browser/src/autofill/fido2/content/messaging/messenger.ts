@@ -92,9 +92,14 @@ export class Messenger {
       abortSignal?.removeEventListener("abort", abortListener);
 
       if (response.type === MessageTypes.ErrorResponse) {
-        const error = new Error();
-        Object.assign(error, JSON.parse(response.error));
-        throw error;
+        const data = JSON.parse(response.error);
+        if (data.type === "DOMException") {
+          throw new DOMException(data.message, data.name);
+        } else {
+          const error = new Error();
+          Object.assign(error, data);
+          throw error;
+        }
       }
 
       return response;

@@ -7,6 +7,18 @@ import {
 
 import { ItemView } from "./item.view";
 
+// based on https://fidoalliance.org/specs/cx/cxf-v1.0-rd-20250313.html#dict-fido2-hmac-credentials
+export class Fido2HmacCredentials {
+  algorithm: string;
+  credWithUV: string;
+  credWithoutUV: string;
+}
+
+// based on https://fidoalliance.org/specs/cx/cxf-v1.0-rd-20250313.html#dict-fido2-extensions
+export class Fido2Extensions {
+  hmacCredentials?: Fido2HmacCredentials;
+}
+
 export class Fido2CredentialView extends ItemView {
   credentialId!: string;
   keyType!: "public-key";
@@ -19,6 +31,7 @@ export class Fido2CredentialView extends ItemView {
   counter!: number;
   rpName?: string;
   userDisplayName?: string;
+  fido2Extensions?: Fido2Extensions;
   discoverable: boolean = false;
   creationDate!: Date;
 
@@ -34,6 +47,7 @@ export class Fido2CredentialView extends ItemView {
     counter: number;
     rpName?: string;
     userDisplayName?: string;
+    fido2Extensions?: Fido2Extensions;
     discoverable?: boolean;
     creationDate: Date;
   }) {
@@ -52,6 +66,7 @@ export class Fido2CredentialView extends ItemView {
     this.counter = f.counter;
     this.rpName = f.rpName;
     this.userDisplayName = f.userDisplayName;
+    this.fido2Extensions = f.fido2Extensions;
     this.discoverable = f.discoverable ?? false;
     this.creationDate = f.creationDate;
   }

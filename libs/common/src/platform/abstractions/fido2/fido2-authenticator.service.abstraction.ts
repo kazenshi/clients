@@ -107,6 +107,7 @@ export interface Fido2AuthenticatorMakeCredentialsParams {
     appidExclude?: string;
     credProps?: boolean;
     uvm?: boolean;
+    prf?: AuthenticationExtensionsPRFInputs;
   };
   /** A Boolean value that indicates that individually-identifying attestation MAY be returned by the authenticator. */
   enterpriseAttestationPossible?: boolean; // Ignored by bitwarden at the moment
@@ -125,6 +126,9 @@ export interface Fido2AuthenticatorMakeCredentialResult {
   authData: Uint8Array<ArrayBuffer>;
   publicKey: Uint8Array<ArrayBuffer>;
   publicKeyAlgorithm: number;
+  extensions?: {
+    prf?: AuthenticationExtensionsPRFOutputs;
+  };
 }
 
 /**
@@ -143,7 +147,10 @@ export interface Fido2AuthenticatorGetAssertionParams {
   requireUserVerification: boolean;
   /** The constant Boolean value true. It is included here as a pseudo-parameter to simplify applying this abstract authenticator model to implementations that may wish to make a test of user presence optional although WebAuthn does not. */
   // requireUserPresence: boolean; // Always required
-  extensions: unknown;
+  /** A map from extension identifiers to their authenticator extension inputs, created by the client based on the extensions requested by the Relying Party, if any. */
+  extensions?: {
+    prf?: AuthenticationExtensionsPRFInputs;
+  };
   /** Forwarded to user interface */
   fallbackSupported: boolean;
 
@@ -158,4 +165,38 @@ export interface Fido2AuthenticatorGetAssertionResult {
   };
   authenticatorData: Uint8Array<ArrayBuffer>;
   signature: Uint8Array<ArrayBuffer>;
+  extensions?: {
+    prf?: AuthenticationExtensionsPRFOutputs;
+  };
+}
+
+/**
+ * This interface represents the input parameters described in
+ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfvalues
+ */
+export interface AuthenticationExtensionsPRFValues {
+  first: BufferSource;
+  second?: BufferSource;
+}
+
+/**
+ * This interface represents the input parameters described in
+ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfoutputs
+ */
+export interface AuthenticationExtensionsPRFOutputs {
+  /** true if, and only if, the PRF is available for use with the created credential. This is only reported during registration and is not present in the case of authentication. */
+  enabled?: boolean;
+  /** The results of evaluating the PRF for the inputs given in eval or evalByCredential. Outputs may not be available during registration; see comments in eval. */
+  results?: AuthenticationExtensionsPRFValues;
+}
+
+/**
+ * This interface represents the input parameters described in
+ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfinputs
+ */
+export interface AuthenticationExtensionsPRFInputs {
+  eval?: AuthenticationExtensionsPRFValues;
+  evalByCredential?: {
+    [index: string]: AuthenticationExtensionsPRFValues;
+  };
 }

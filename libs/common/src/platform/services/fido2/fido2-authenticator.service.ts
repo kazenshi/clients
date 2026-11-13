@@ -43,6 +43,131 @@ export const AAGUID = new Uint8Array([
 
 const KeyUsages: KeyUsage[] = ["sign"];
 
+// FIXME: hacky workaround until extension data are supported by the sdk
+async function hmacCredentialsShim(
+  fido2Credential: Fido2CredentialView,
+): Promise<Fido2CredentialView> {
+  // deterministically derive creds from secret key value
+  const keyBuffer = Fido2Utils.stringToArray(fido2Credential.keyValue);
+  const keyValue = await crypto.subtle.importKey(
+    "pkcs8",
+    new Uint8Array(keyBuffer),
+    {
+      name: fido2Credential.keyAlgorithm,
+      namedCurve: fido2Credential.keyCurve,
+    } as EcKeyImportParams,
+    true,
+    KeyUsages,
+  );
+
+  const privateKeyJwk = await crypto.subtle.exportKey("jwk", keyValue);
+  const hmacSecret = await crypto.subtle.importKey(
+    "raw",
+    Fido2Utils.bufferSourceToUint8Array(Fido2Utils.stringToArray(privateKeyJwk.d)),
+    { name: "HKDF" },
+    false,
+    ["deriveBits"],
+  );
+  const hmacCreds = await Promise.all(
+    [
+      new Uint8Array([99, 114, 101, 100, 87, 105, 116, 104, 85, 118]), // credWithUv
+      new Uint8Array([99, 114, 101, 100, 87, 105, 116, 104, 111, 117, 116, 85, 118]), // credWithoutUv
+    ].map((info) =>
+      crypto.subtle.deriveBits(
+        {
+          name: "HKDF",
+          hash: "SHA-512",
+          salt: Fido2Utils.bufferSourceToUint8Array(
+            parseCredentialId(fido2Credential.credentialId),
+          ),
+          info: info,
+        } as HkdfParams,
+        hmacSecret,
+        256,
+      ),
+    ),
+  );
+
+  fido2Credential.fido2Extensions = {
+    hmacCredentials: {
+      algorithm: "hmac-sha256",
+      credWithUV: Fido2Utils.arrayToString(new Uint8Array(hmacCreds[0])),
+      credWithoutUV: Fido2Utils.arrayToString(new Uint8Array(hmacCreds[1])),
+    },
+  };
+
+  return fido2Credential;
+}
+
+async function computePRF(
+  fido2Credential: Fido2CredentialView,
+  params: AuthenticationExtensionsPRFInputs,
+  userVerified: boolean,
+): Promise<AuthenticationExtensionsPRFValues> {
+  // 3. Initialize the prf extension output to an empty dictionary.
+  const output = {} as AuthenticationExtensionsPRFValues;
+
+  // 4. Let ev be null, and try to find any applicable PRF input(s):
+  // a. If evalByCredential is present and contains an entry whose key is the base64url encoding of the credential ID that will be returned, let ev be the value of that entry.
+  // b. If ev is null and eval is present, then let ev be the value of eval.
+  const id = Fido2Utils.arrayToString(parseCredentialId(fido2Credential.credentialId));
+  const ev = params?.evalByCredential?.[id] ?? params?.eval ?? null;
+  let salt1, salt2;
+
+  // 5. If ev is not null:
+  if (ev) {
+    const webAuthnPRFPrefix = new Uint8Array([
+      0x57, 0x65, 0x62, 0x41, 0x75, 0x74, 0x68, 0x6e, 0x20, 0x50, 0x52, 0x46, 0x00,
+    ]);
+
+    // a. Let salt1 be the value of SHA-256(UTF8Encode("WebAuthn PRF") || 0x00 || ev.first).
+    const input = new Uint8Array(13 + ev.first.byteLength);
+    input.set(webAuthnPRFPrefix, 0);
+    input.set(Fido2Utils.bufferSourceToUint8Array(ev.first), 13);
+
+    salt1 = new Uint8Array(await crypto.subtle.digest({ name: "SHA-256" }, input));
+
+    // b. If ev.second is present, let salt2 be the value of SHA-256(UTF8Encode("WebAuthn PRF") || 0x00 || ev.second).
+    if (ev.second) {
+      const input = new Uint8Array(13 + ev.second.byteLength);
+      input.set(webAuthnPRFPrefix, 0);
+      input.set(Fido2Utils.bufferSourceToUint8Array(ev.second), 13);
+
+      salt2 = new Uint8Array(await crypto.subtle.digest({ name: "SHA-256" }, input));
+    }
+
+    // c. If the authenticator supports the CTAP2 hmac-secret extension [FIDO-CTAP]:
+    //  i) Send an hmac-secret extension to the authenticator using the values of salt1 and, if set, salt2 as the parameters of the same name in that process.
+    //  ii) Decrypt the extension result and set results to the PRF result(s), if any.
+    // d. If the authenticator does not support the CTAP2 hmac-secret extension [FIDO-CTAP], but does support some other implementation compatible with the abstract authenticator processing defined below:
+    // i) Use some unspecified mechanism to convey salt1 and, if defined, salt2 to the authenticator as PRF inputs, in that order.
+    // ii) Use some unspecified mechanism to receive the PRF outputs from the authenticator as an AuthenticationExtensionsPRFValues value results. Set results to results.
+
+    // todo respect key algorithm
+    const hmacKey = await crypto.subtle.importKey(
+      "raw",
+      Fido2Utils.stringToArray(
+        userVerified
+          ? fido2Credential.fido2Extensions.hmacCredentials.credWithUV
+          : fido2Credential.fido2Extensions.hmacCredentials.credWithoutUV,
+      ),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      KeyUsages,
+    );
+
+    // output1: HMAC-SHA-256(CredRandom, salt1)
+    output.first = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, salt1));
+
+    // output2: HMAC-SHA-256(CredRandom, salt2)
+    if (salt2) {
+      output.second = new Uint8Array(await crypto.subtle.sign("HMAC", hmacKey, salt2));
+    }
+  }
+
+  return output;
+}
+
 /**
  * Bitwarden implementation of the WebAuthn Authenticator Model as described by W3C
  * https://www.w3.org/TR/webauthn-3/#sctn-authenticator-model
@@ -148,6 +273,12 @@ export class Fido2AuthenticatorService<
         throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.NotAllowed);
       }
 
+      // Client extension processing (registration)
+      // 1. If evalByCredential is present, return a DOMException whose name is “NotSupportedError”.
+      if (params.extensions?.prf?.evalByCredential) {
+        throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.NotSupported);
+      }
+
       try {
         keyPair = await createKeyPair();
         pubKeyDer = new Uint8Array(await crypto.subtle.exportKey("spki", keyPair.publicKey));
@@ -215,12 +346,25 @@ export class Fido2AuthenticatorService<
         }),
       );
 
+      let prfResults;
+      if (params.extensions?.prf) {
+        prfResults = await computePRF(fido2Credential, params.extensions?.prf, userVerified);
+      }
+
       return {
         credentialId: parseCredentialId(credentialId),
         attestationObject,
         authData,
         publicKey: pubKeyDer,
         publicKeyAlgorithm: -7,
+        extensions: {
+          prf: prfResults
+            ? {
+                enabled: !!params?.extensions?.prf,
+                results: prfResults,
+              }
+            : undefined,
+        },
       };
     } finally {
       userInterfaceSession.close();
@@ -312,9 +456,47 @@ export class Fido2AuthenticatorService<
         throw new Fido2AuthenticatorError(Fido2AuthenticatorErrorCode.NotAllowed);
       }
 
+      // Client extension processing (authentication)
+      // 1. If evalByCredential is not empty but allowCredentials is empty, return a DOMException whose name is “NotSupportedError”.
+      if (
+        Object.keys(params.extensions?.prf?.evalByCredential ?? {}).length &&
+        !params.allowCredentialDescriptorList?.length
+      ) {
+        // todo: probably better to add a custom error type here, instead of using DOMException?
+        throw new DOMException(
+          "'prf' extension has 'evalByCredential' with an empty allow list",
+          "NotSupportedError",
+        );
+      }
+
+      // 2. If any key in evalByCredential is the empty string, or is not a valid base64url encoding, or does not equal the id of some element of allowCredentials after performing base64url decoding, then return a DOMException whose name is “SyntaxError”.
+      if (
+        Object.keys(params.extensions?.prf?.evalByCredential ?? {}).some((k) => {
+          if (!k) {
+            return true;
+          }
+
+          try {
+            Fido2Utils.stringToArray(k);
+            return !params.allowCredentialDescriptorList.some(
+              (e) => Fido2Utils.arrayToString(e.id) === k,
+            );
+          } catch {
+            return true;
+          }
+        })
+      ) {
+        // todo: probably better to add a custom error type here, instead of using DOMException?
+        throw new DOMException(
+          "'prf' extension contains 'evalByCredential' key that doesn't match any in allowedCredentials",
+          "SyntaxError",
+        );
+      }
+
       try {
         const selectedFido2Credential = selectedCipher.login.fido2Credentials[0];
         const selectedCredentialId = selectedFido2Credential.credentialId;
+        await hmacCredentialsShim(selectedFido2Credential);
 
         if (selectedFido2Credential.counter > 0) {
           ++selectedFido2Credential.counter;
@@ -346,6 +528,15 @@ export class Fido2AuthenticatorService<
           privateKey: await getPrivateKeyFromFido2Credential(selectedFido2Credential),
         });
 
+        let prfResults;
+        if (params.extensions?.prf) {
+          prfResults = await computePRF(
+            selectedFido2Credential,
+            params.extensions?.prf,
+            userVerified,
+          );
+        }
+
         return {
           authenticatorData,
           selectedCredential: {
@@ -353,6 +544,9 @@ export class Fido2AuthenticatorService<
             userHandle: Fido2Utils.stringToArray(selectedFido2Credential.userHandle),
           },
           signature,
+          extensions: {
+            prf: prfResults ? { results: prfResults } : undefined,
+          },
         };
       } catch (error) {
         this.logService?.error(
@@ -505,6 +699,18 @@ async function createKeyView(
   fido2Credential.userDisplayName = params.userEntity.displayName;
   fido2Credential.discoverable = params.requireResidentKey;
   fido2Credential.creationDate = new Date();
+
+  await hmacCredentialsShim(fido2Credential);
+  // FIXME: potentially replace with independent random seeds, once sdk is able to persist these
+  /*
+  fido2Credential.fido2Extensions = {
+    hmacCredentials: {
+      algorithm: "hmac-sha256",
+      credWithUV: Fido2Utils.arrayToString(crypto.getRandomValues(new Uint8Array(32))),
+      credWithoutUV: Fido2Utils.arrayToString(crypto.getRandomValues(new Uint8Array(32))),
+    }
+  };
+  */
 
   return fido2Credential;
 }

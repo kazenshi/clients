@@ -37,6 +37,55 @@ export class WebauthnUtils {
       })),
       extensions: {
         credProps: keyOptions.extensions?.credProps,
+        prf: keyOptions.extensions?.prf
+          ? {
+              eval: keyOptions.extensions.prf?.eval
+                ? {
+                    ...(keyOptions.extensions.prf.eval?.first
+                      ? {
+                          first: Fido2Utils.arrayToString(
+                            Fido2Utils.bufferSourceToUint8Array(
+                              keyOptions.extensions.prf.eval?.first,
+                            ),
+                          ),
+                        }
+                      : undefined),
+                    ...(keyOptions.extensions.prf.eval?.second
+                      ? {
+                          second: Fido2Utils.arrayToString(
+                            Fido2Utils.bufferSourceToUint8Array(
+                              keyOptions.extensions.prf.eval?.second,
+                            ),
+                          ),
+                        }
+                      : undefined),
+                  }
+                : undefined,
+              evalByCredential: keyOptions.extensions.prf?.evalByCredential
+                ? Object.fromEntries(
+                    Object.entries(keyOptions.extensions.prf.evalByCredential).map(([k, v]) => [
+                      k,
+                      {
+                        ...(v?.first
+                          ? {
+                              first: Fido2Utils.arrayToString(
+                                Fido2Utils.bufferSourceToUint8Array(v?.first),
+                              ),
+                            }
+                          : undefined),
+                        ...(v?.second
+                          ? {
+                              second: Fido2Utils.arrayToString(
+                                Fido2Utils.bufferSourceToUint8Array(v?.second),
+                              ),
+                            }
+                          : undefined),
+                      },
+                    ]),
+                  )
+                : undefined,
+            }
+          : undefined,
       },
       pubKeyCredParams: keyOptions.pubKeyCredParams
         .map((params) => ({
@@ -86,7 +135,22 @@ export class WebauthnUtils {
         },
       } as AuthenticatorAttestationResponse,
       getClientExtensionResults: () => ({
-        credProps: result.extensions.credProps,
+        credProps: result.extensions?.credProps,
+        prf: result.extensions?.prf
+          ? {
+              enabled: result.extensions.prf?.enabled,
+              results: result.extensions.prf?.results
+                ? {
+                    ...(result.extensions.prf.results?.first
+                      ? { first: Fido2Utils.stringToArray(result.extensions.prf.results?.first) }
+                      : undefined),
+                    ...(result.extensions.prf.results?.second
+                      ? { second: Fido2Utils.stringToArray(result.extensions.prf.results?.second) }
+                      : undefined),
+                  }
+                : undefined,
+            }
+          : undefined,
       }),
       toJSON: () => Fido2Utils.createResultToJson(result),
     } as PublicKeyCredential;
@@ -121,6 +185,57 @@ export class WebauthnUtils {
       ),
       rpId: keyOptions.rpId,
       userVerification: keyOptions.userVerification,
+      extensions: {
+        prf: keyOptions.extensions?.prf
+          ? {
+              eval: keyOptions.extensions.prf?.eval
+                ? {
+                    ...(keyOptions.extensions.prf.eval?.first
+                      ? {
+                          first: Fido2Utils.arrayToString(
+                            Fido2Utils.bufferSourceToUint8Array(
+                              keyOptions.extensions.prf.eval?.first,
+                            ),
+                          ),
+                        }
+                      : undefined),
+                    ...(keyOptions.extensions.prf.eval?.second
+                      ? {
+                          second: Fido2Utils.arrayToString(
+                            Fido2Utils.bufferSourceToUint8Array(
+                              keyOptions.extensions.prf.eval?.second,
+                            ),
+                          ),
+                        }
+                      : undefined),
+                  }
+                : undefined,
+              evalByCredential: keyOptions.extensions.prf?.evalByCredential
+                ? Object.fromEntries(
+                    Object.entries(keyOptions.extensions.prf.evalByCredential).map(([k, v]) => [
+                      k,
+                      {
+                        ...(v?.first
+                          ? {
+                              first: Fido2Utils.arrayToString(
+                                Fido2Utils.bufferSourceToUint8Array(v?.first),
+                              ),
+                            }
+                          : undefined),
+                        ...(v?.second
+                          ? {
+                              second: Fido2Utils.arrayToString(
+                                Fido2Utils.bufferSourceToUint8Array(v?.second),
+                              ),
+                            }
+                          : undefined),
+                      },
+                    ]),
+                  )
+                : undefined,
+            }
+          : undefined,
+      },
       timeout: keyOptions.timeout,
       mediation: options.mediation,
       fallbackSupported,
@@ -138,7 +253,23 @@ export class WebauthnUtils {
         signature: Fido2Utils.stringToArray(result.signature).buffer,
         userHandle: Fido2Utils.stringToArray(result.userHandle).buffer,
       } as AuthenticatorAssertionResponse,
-      getClientExtensionResults: () => ({}),
+      getClientExtensionResults: () => ({
+        prf: result.extensions?.prf
+          ? {
+              enabled: result.extensions.prf?.enabled,
+              results: result.extensions.prf?.results
+                ? {
+                    ...(result.extensions.prf.results?.first
+                      ? { first: Fido2Utils.stringToArray(result.extensions.prf.results?.first) }
+                      : undefined),
+                    ...(result.extensions.prf.results?.second
+                      ? { second: Fido2Utils.stringToArray(result.extensions.prf.results?.second) }
+                      : undefined),
+                  }
+                : undefined,
+            }
+          : undefined,
+      }),
       authenticatorAttachment: "platform",
       toJSON: () => Fido2Utils.getResultToJson(result),
     } as PublicKeyCredential;
