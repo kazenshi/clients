@@ -465,7 +465,15 @@ export class Fido2Background implements Fido2BackgroundInterface {
     Promise.resolve(messageResponse)
       .then(
         (response) => sendResponse(response),
-        (error) => sendResponse({ error: { ...error, message: error.message } }),
+        (error) => {
+          if (error instanceof DOMException) {
+            return sendResponse({
+              error: { ...error, type: "DOMException", name: error.name, message: error.message },
+            });
+          }
+
+          return sendResponse({ error: { ...error, message: error.message } });
+        },
       )
       .catch(this.logService.error);
 

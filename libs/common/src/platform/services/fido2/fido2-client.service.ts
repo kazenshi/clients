@@ -249,6 +249,37 @@ export class Fido2ClientService<
       };
     }
 
+    let prf;
+    if (params.extensions?.prf) {
+      prf = makeCredentialResult.extensions?.prf
+        ? {
+            enabled: makeCredentialResult.extensions.prf?.enabled,
+            results: makeCredentialResult.extensions.prf?.results
+              ? {
+                  ...(makeCredentialResult.extensions.prf.results?.first
+                    ? {
+                        first: Fido2Utils.arrayToString(
+                          Fido2Utils.bufferSourceToUint8Array(
+                            makeCredentialResult.extensions.prf.results?.first,
+                          ),
+                        ),
+                      }
+                    : null),
+                  ...(makeCredentialResult.extensions.prf.results?.second
+                    ? {
+                        second: Fido2Utils.arrayToString(
+                          Fido2Utils.bufferSourceToUint8Array(
+                            makeCredentialResult.extensions.prf.results?.second,
+                          ),
+                        ),
+                      }
+                    : null),
+                }
+              : undefined,
+          }
+        : undefined;
+    }
+
     timeoutSubscription?.unsubscribe();
 
     return {
@@ -259,7 +290,7 @@ export class Fido2ClientService<
       publicKey: Fido2Utils.arrayToString(makeCredentialResult.publicKey),
       publicKeyAlgorithm: makeCredentialResult.publicKeyAlgorithm,
       transports: ["internal", "hybrid"],
-      extensions: { credProps },
+      extensions: { credProps, prf },
     };
   }
 
@@ -372,6 +403,10 @@ export class Fido2ClientService<
         throw new DOMException("Unknown error occured.", "InvalidStateError");
       }
 
+      if (error instanceof DOMException) {
+        throw error;
+      }
+
       this.logService?.info(`[Fido2Client] Aborted by user: ${error}`);
       throw new DOMException(
         "The operation either timed out or was not allowed.",
@@ -462,6 +497,35 @@ export class Fido2ClientService<
           ? Fido2Utils.arrayToString(getAssertionResult.selectedCredential.userHandle)
           : undefined,
       signature: Fido2Utils.arrayToString(getAssertionResult.signature),
+      extensions: {
+        prf: getAssertionResult.extensions?.prf
+          ? {
+              enabled: getAssertionResult.extensions.prf?.enabled,
+              results: getAssertionResult.extensions.prf?.results
+                ? {
+                    ...(getAssertionResult.extensions.prf.results?.first
+                      ? {
+                          first: Fido2Utils.arrayToString(
+                            Fido2Utils.bufferSourceToUint8Array(
+                              getAssertionResult.extensions.prf.results?.first,
+                            ),
+                          ),
+                        }
+                      : null),
+                    ...(getAssertionResult.extensions.prf.results?.second
+                      ? {
+                          second: Fido2Utils.arrayToString(
+                            Fido2Utils.bufferSourceToUint8Array(
+                              getAssertionResult.extensions.prf.results?.second,
+                            ),
+                          ),
+                        }
+                      : null),
+                  }
+                : undefined,
+            }
+          : undefined,
+      },
     };
   }
 
@@ -539,6 +603,33 @@ function mapToMakeCredentialParams({
       displayName: params.user.displayName,
       name: params.user.name,
     },
+    extensions: {
+      prf: params.extensions?.prf
+        ? {
+            eval: params.extensions.prf?.eval
+              ? {
+                  ...(params.extensions.prf.eval?.first
+                    ? { first: Fido2Utils.stringToArray(params.extensions.prf.eval?.first) }
+                    : undefined),
+                  ...(params.extensions.prf.eval?.second
+                    ? { second: Fido2Utils.stringToArray(params.extensions.prf.eval?.second) }
+                    : undefined),
+                }
+              : undefined,
+            evalByCredential: params.extensions.prf?.evalByCredential
+              ? Object.fromEntries(
+                  Object.entries(params.extensions.prf.evalByCredential).map(([k, v]) => [
+                    k,
+                    {
+                      ...(v?.first ? { first: Fido2Utils.stringToArray(v?.first) } : undefined),
+                      ...(v?.second ? { second: Fido2Utils.stringToArray(v?.second) } : undefined),
+                    },
+                  ]),
+                )
+              : undefined,
+          }
+        : undefined,
+    },
     fallbackSupported: params.fallbackSupported,
   };
 }
@@ -571,7 +662,33 @@ function mapToGetAssertionParams({
     requireUserVerification,
     hash: clientDataHash,
     allowCredentialDescriptorList,
-    extensions: {},
+    extensions: {
+      prf: params.extensions?.prf
+        ? {
+            eval: params.extensions.prf?.eval
+              ? {
+                  ...(params.extensions.prf.eval?.first
+                    ? { first: Fido2Utils.stringToArray(params.extensions.prf.eval?.first) }
+                    : undefined),
+                  ...(params.extensions.prf.eval?.second
+                    ? { second: Fido2Utils.stringToArray(params.extensions.prf.eval?.second) }
+                    : undefined),
+                }
+              : undefined,
+            evalByCredential: params.extensions.prf?.evalByCredential
+              ? Object.fromEntries(
+                  Object.entries(params.extensions.prf.evalByCredential).map(([k, v]) => [
+                    k,
+                    {
+                      ...(v?.first ? { first: Fido2Utils.stringToArray(v?.first) } : undefined),
+                      ...(v?.second ? { second: Fido2Utils.stringToArray(v?.second) } : undefined),
+                    },
+                  ]),
+                )
+              : undefined,
+          }
+        : undefined,
+    },
     fallbackSupported: params.fallbackSupported,
     assumeUserPresence,
   };

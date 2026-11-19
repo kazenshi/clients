@@ -86,6 +86,7 @@ export interface CreateCredentialParams {
     appidExclude?: string; // Not supported
     uvm?: boolean; // Not supported
     credProps?: boolean;
+    prf?: AuthenticationExtensionsPRFInputsJSON;
   };
   /**
    * This member contains information about the desired properties of the credential to be created.
@@ -128,6 +129,7 @@ export interface CreateCredentialResult {
     credProps?: {
       rk: boolean;
     };
+    prf?: AuthenticationExtensionsPRFOutputsJSON;
   };
 }
 
@@ -147,6 +149,9 @@ export interface AssertCredentialParams {
   sameOriginWithAncestors: boolean;
   mediation?: "silent" | "optional" | "required" | "conditional";
   fallbackSupported: boolean;
+  extensions?: {
+    prf?: AuthenticationExtensionsPRFInputsJSON;
+  };
 }
 
 /**
@@ -158,6 +163,9 @@ export interface AssertCredentialResult {
   authenticatorData: string;
   signature: string;
   userHandle: string;
+  extensions?: {
+    prf?: AuthenticationExtensionsPRFOutputsJSON;
+  };
 }
 
 /**
@@ -181,4 +189,35 @@ export class FallbackRequestedError extends Error {
   constructor() {
     super("FallbackRequested");
   }
+}
+
+/**
+ * This interface represents the input parameters described in
+ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfvaluesjson
+ */
+export interface AuthenticationExtensionsPRFValuesJSON {
+  first: string;
+  second?: string;
+}
+
+/**
+ * This interface represents the input parameters described in
+ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfoutputsjson
+ */
+export interface AuthenticationExtensionsPRFOutputsJSON {
+  /** true if, and only if, the PRF is available for use with the created credential. This is only reported during registration and is not present in the case of authentication. */
+  enabled?: boolean;
+  /** The results of evaluating the PRF for the inputs given in eval or evalByCredential. Outputs may not be available during registration; see comments in eval. */
+  results?: AuthenticationExtensionsPRFValuesJSON;
+}
+
+/**
+ * This interface represents the input parameters described in
+ * https://w3c.github.io/webauthn/#dictdef-authenticationextensionsprfinputsjson
+ */
+export interface AuthenticationExtensionsPRFInputsJSON {
+  eval?: AuthenticationExtensionsPRFValuesJSON;
+  evalByCredential?: {
+    [index: string]: AuthenticationExtensionsPRFValuesJSON;
+  };
 }

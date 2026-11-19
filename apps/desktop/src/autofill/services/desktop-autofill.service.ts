@@ -694,7 +694,11 @@ export class DesktopAutofillService implements OnDestroy {
       rpId: request.rpId,
       hash: new Uint8Array(request.clientDataHash),
       allowCredentialDescriptorList: allowedCredentials,
-      extensions: {},
+      extensions: {
+        prf: {
+          enabled: true,
+        },
+      },
       requireUserVerification:
         request.userVerification === "required" || request.userVerification === "preferred",
       fallbackSupported: false,
